@@ -1,0 +1,16 @@
+numpy
+scikit-learn
+sentence-transformers
+torch
+tenseal
+concrete-python
+phe
+openfhe
+python-dotenv
+
+# GPU note:
+# - Install CUDA-enabled torch wheel when benchmarking on NVIDIA GPU.
+# - For Concrete GPU wheel, use Zama GPU index when needed:
+#   uv pip install --upgrade concrete-python --extra-index-url https://pypi.zama.ai/gpu/
+#   or use this instead to bypass tls issue (expired tls when using native-tls)
+#   uv pip install --upgrade concrete-python --extra-index-url https://pypi.zama.ai/gpu/ --allow-insecure-host pypi.zama.ai

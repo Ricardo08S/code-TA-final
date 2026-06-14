@@ -1,0 +1,47 @@
+# Runtime output — tidak perlu di-commit
+logs/
+output/
+
+# Artifact terlatih dan circuit TFHE yang di-compile — bisa sangat besar
+artifacts/
+.artifacts/
+
+# Docs folder (dokumentasi resmi ada di README.md)
+docs/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Environment file aktual (jangan commit credential)
+.env
+.env.local
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Model cache sentence-transformers (bisa puluhan GB)
+~/.cache/huggingface/
