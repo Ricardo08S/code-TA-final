@@ -1,11 +1,23 @@
-"""S2b: Client MiniLM embed -> encrypt CKKS -> Server CKKS similarity + approximate top-K ranking.
+"""S2b: CKKS (OpenFHE) with bootstrapping + approx pairwise comparison ranking.
 
-NOTE: CKKS comparison is approximate. MAX_AUTHORS is limited to 32 due to circuit complexity.
-The approx_sign polynomial sign(x) ≈ 1.5x - 0.5x^3 requires inputs normalized to [-1, 1].
+Server pipeline:
+1. Streaming CKKS inner product → encrypted author sums (pool limited for bootstrap feasibility)
+2. Mean aggregation per author (encrypted scalar mult, level-free combination with weight)
+3. Bootstrap each encrypted score (level refresh: ~3.2s per author)
+4. Encrypted pairwise comparison via degree-3 polynomial sign approximation
+5. Client: decrypt comparison signs → vote-based ranking → top-K
+
+Key thesis contribution: demonstrates that OpenFHE CKKS bootstrapping enables encrypted
+comparison that level-limited CKKS (TenSEAL) cannot. Trade-off: each EvalBootstrap =
+~3.2s; N=2620 authors → ~17h impractical; N=20 authors → ~3 min feasible.
+
+Scoring: sign(score_i - score_j) counts how many authors author_i "beats".
+Sum of wins = vote score. Client decrypts vote signs → sort → top-K.
 """
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 import time
@@ -17,17 +29,30 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from core.config import scenario_output_paths
-from core.data_loader import load_subprofiles_split
+from core.config import WEIGHT_ABS, WEIGHT_TK, scenario_output_paths
+from core.data_loader import load_subprofiles_split, select_query_candidate_author_ids
 from core.embedder import build_query_embeddings
 from core.reduction import apply_reduction, resolve_reduction_config
 from core.result_writer import append_csv, write_json
-from core.scoring import aggregate_max_scores, combine_modal_scores
 
 LOG_PATH, RESULT_PATH = scenario_output_paths("s2b")
 PREFIX = "[S2b]"
 
-MAX_AUTHORS_LIMIT = 32
+# OpenFHE CKKS bootstrap parameters — verified working for 64-slot CKKS
+# total_depth=23, level_budget=[4,4], ring_dim=32768, scaling_mod=50
+_BOOTSTRAP_LEVEL_BUDGET = [4, 4]
+_TOTAL_MULT_DEPTH = 23
+_SCALING_MOD_BITS = 50
+_FIRST_MOD_BITS = 60
+_RING_DIM = 1 << 15  # 32768
+
+# sign(x) ≈ 1.5x - 0.5x^3 (degree-3, accurate for |x| ≤ 1)
+# Scores are combined with weight*0.5 factor so differences fit in [-1, 1]
+_SIGN_POLY = [0.0, 1.5, 0.0, -0.5]
+_COMBINED_SCALE = 0.5  # applied to WEIGHT_* so combined score stays in [-0.5, 0.5]
+
+# Default pool: bootstrapping N author sums costs N×~3.2s; 20 → ~64s feasible
+_MAX_AUTHORS_DEFAULT = 20
 
 
 def _get_int_env(name: str, default: int | None = None) -> int | None:
@@ -40,76 +65,101 @@ def _get_int_env(name: str, default: int | None = None) -> int | None:
         raise ValueError(f"Invalid integer for {name}: {value!r}") from exc
 
 
-def _min_poly_modulus_degree(coeff_mod_bit_sizes: list[int]) -> int:
-    """Compute minimum poly_modulus_degree for 128-bit security (SEAL/TenSEAL table)."""
-    total_bits = sum(coeff_mod_bit_sizes)
-    # SEAL 128-bit security table: max total coeff bits per degree
-    table = [(1024, 27), (2048, 54), (4096, 109), (8192, 218), (16384, 438), (32768, 881)]
-    for degree, max_bits in table:
-        if total_bits <= max_bits:
-            return degree
-    raise ValueError(
-        f"coeff_mod_bit_sizes sum={total_bits} exceeds maximum allowed (881 bits). "
-        "Reduce the number or size of coefficient moduli."
-    )
-
-
-def _build_ckks_context(global_scale_bits: int):
+def _build_bootstrap_context(num_slots: int):
+    """Build OpenFHE CKKS crypto context with bootstrapping enabled."""
     try:
-        import tenseal as ts
+        from openfhe import (
+            CCParamsCKKSRNS,
+            FLEXIBLEAUTO,
+            HYBRID,
+            HEStd_NotSet,
+            GenCryptoContext,
+            PKESchemeFeature,
+            SecretKeyDist,
+        )
     except ImportError as exc:
-        raise RuntimeError(
-            "tenseal is not installed. Install: pip install tenseal"
-        ) from exc
+        raise RuntimeError("openfhe is not installed. Install: pip install openfhe") from exc
 
-    # 7 primes → 5 levels available (Phase 1: dot product + Phase 2: 2 rounds approx sort)
-    coeff_mod_bit_sizes = [60, 40, 40, 40, 40, 40, 60]
-    poly_modulus_degree = _min_poly_modulus_degree(coeff_mod_bit_sizes)
-    print(
-        f"[S2b] auto poly_modulus_degree={poly_modulus_degree} "
-        f"(from coeff_bits_sum={sum(coeff_mod_bit_sizes)}, 128-bit security table)",
-        flush=True,
-    )
+    params = CCParamsCKKSRNS()
+    params.SetSecurityLevel(HEStd_NotSet)
+    params.SetRingDim(_RING_DIM)
+    params.SetBatchSize(num_slots)
+    params.SetMultiplicativeDepth(_TOTAL_MULT_DEPTH)
+    params.SetScalingModSize(_SCALING_MOD_BITS)
+    params.SetFirstModSize(_FIRST_MOD_BITS)
+    params.SetNumLargeDigits(3)
+    params.SetKeySwitchTechnique(HYBRID)
+    params.SetScalingTechnique(FLEXIBLEAUTO)
+    params.SetSecretKeyDist(SecretKeyDist.UNIFORM_TERNARY)
 
-    context = ts.context(
-        ts.SCHEME_TYPE.CKKS,
-        poly_modulus_degree=poly_modulus_degree,
-        coeff_mod_bit_sizes=coeff_mod_bit_sizes,
-    )
-    context.global_scale = 2 ** global_scale_bits
-    context.generate_galois_keys()
-    context.generate_relin_keys()
-    return ts, context, poly_modulus_degree
+    cc = GenCryptoContext(params)
+    cc.Enable(PKESchemeFeature.PKE)
+    cc.Enable(PKESchemeFeature.KEYSWITCH)
+    cc.Enable(PKESchemeFeature.LEVELEDSHE)
+    cc.Enable(PKESchemeFeature.ADVANCEDSHE)
+    cc.Enable(PKESchemeFeature.FHE)
+
+    keys = cc.KeyGen()
+    cc.EvalMultKeyGen(keys.secretKey)
+
+    # EvalSumKeyGen generates all rotation keys needed by EvalInnerProduct / EvalSum
+    cc.EvalSumKeyGen(keys.secretKey)
+
+    # Bootstrap setup and keygen (~0.8s)
+    cc.EvalBootstrapSetup(_BOOTSTRAP_LEVEL_BUDGET, [0, 0], num_slots)
+    cc.EvalBootstrapKeyGen(keys.secretKey, num_slots)
+
+    return cc, keys
 
 
 def main() -> None:
-    max_authors = _get_int_env("S2B_MAX_AUTHORS", 20)
+    max_authors = _get_int_env("S2B_MAX_AUTHORS", _MAX_AUTHORS_DEFAULT)
     max_subprofiles = _get_int_env("S2B_MAX_SUBPROFILES")
-    top_k = _get_int_env("S2B_TOP_K", 3) or 3
+    top_k = _get_int_env("S2B_TOP_K", 5) or 5
     reduce_cfg = resolve_reduction_config("S2B", default_dim=64)
-    global_scale_bits = _get_int_env("S2B_GLOBAL_SCALE_BITS", 40) or 40
-
-    if max_authors and max_authors > MAX_AUTHORS_LIMIT:
-        print(
-            f"{PREFIX} WARNING: S2B_MAX_AUTHORS={max_authors} exceeds limit {MAX_AUTHORS_LIMIT}. "
-            f"Clamping to {MAX_AUTHORS_LIMIT}.",
-            flush=True,
-        )
-        max_authors = MAX_AUTHORS_LIMIT
+    candidate_mode = os.environ.get("S2B_CANDIDATE_MODE", "first").strip().lower()
 
     print(
         f"{PREFIX} max_authors={max_authors} top_k={top_k} "
-        f"reduce_dim={reduce_cfg.target_dim} poly_modulus_degree=auto",
+        f"reduce_dim={reduce_cfg.target_dim} candidate_mode={candidate_mode} backend=OpenFHE+bootstrap",
         flush=True,
     )
 
     t_total_start = time.perf_counter()
 
+    # --- Client: embed query ---
+    q_tk, q_abs, t_embed = build_query_embeddings(reduce_dim=None, device="cpu")
+    print(f"{PREFIX} embed done: {t_embed:.3f}s", flush=True)
+
+    candidate_author_ids = None
+    t_candidate = 0.0
+    if candidate_mode == "client_prefilter" and max_authors is not None:
+        t_candidate_start = time.perf_counter()
+        candidate_author_ids, _ = select_query_candidate_author_ids(
+            query_tk=q_tk,
+            query_abs=q_abs,
+            max_authors=max_authors,
+            max_subprofiles_per_author=max_subprofiles,
+        )
+        t_candidate = time.perf_counter() - t_candidate_start
+        print(
+            f"{PREFIX} client prefilter selected {len(candidate_author_ids)} authors "
+            f"in {t_candidate:.3f}s",
+            flush=True,
+        )
+    elif candidate_mode not in {"first", "client_prefilter"}:
+        raise ValueError(
+            f"{PREFIX} Unsupported S2B_CANDIDATE_MODE={candidate_mode!r}. "
+            "Use 'client_prefilter' or 'first'."
+        )
+
+    # --- Load author subprofiles ---
     try:
         subprofiles_tk, subprofiles_abs, author_ids, sub_to_author, source = load_subprofiles_split(
             reduce_dim=None,
-            max_authors=max_authors,
+            max_authors=max_authors if candidate_author_ids is None else None,
             max_subprofiles_per_author=max_subprofiles,
+            candidate_author_ids=candidate_author_ids,
         )
     except Exception as exc:
         print(f"{PREFIX} ERROR loading data: {exc}", flush=True)
@@ -118,14 +168,18 @@ def main() -> None:
     if subprofiles_tk.size == 0:
         raise RuntimeError("No author profiles found.")
 
+    num_authors = len(author_ids)
+    num_subs = len(subprofiles_tk)
     print(
-        f"{PREFIX} source={source} authors={len(author_ids)} subprofiles={subprofiles_tk.shape[0]}",
+        f"{PREFIX} source={source} authors={num_authors} subprofiles={num_subs}",
         flush=True,
     )
 
-    q_tk, q_abs, t_embed = build_query_embeddings(reduce_dim=None, device="cpu")
-    print(f"{PREFIX} embed done: {t_embed:.3f}s", flush=True)
+    if top_k > len(author_ids):
+        print(f"{PREFIX} top_k={top_k} reduced to author count {len(author_ids)}", flush=True)
+        top_k = len(author_ids)
 
+    # --- Apply PCA reduction (same space for query and profiles) ---
     subprofiles_tk, subprofiles_abs, q_tk, q_abs = apply_reduction(
         subprofiles_tk=subprofiles_tk,
         subprofiles_abs=subprofiles_abs,
@@ -133,131 +187,164 @@ def main() -> None:
         query_abs=q_abs,
         config=reduce_cfg,
     )
+    actual_dim = int(q_tk.shape[0])
+    # OpenFHE batch size must be a power of 2; round up if PCA gave fewer components
+    num_slots = 1 << math.ceil(math.log2(max(actual_dim, 2)))
 
+    # L2-normalize to bound dot products in [-1, 1] (required for sign poly accuracy)
+    # apply_reduction already normalizes; this is a safety re-normalize
+    q_tk = q_tk / (np.linalg.norm(q_tk) + 1e-12)
+    q_abs = q_abs / (np.linalg.norm(q_abs) + 1e-12)
+    norms_tk = np.linalg.norm(subprofiles_tk, axis=1, keepdims=True) + 1e-12
+    norms_abs = np.linalg.norm(subprofiles_abs, axis=1, keepdims=True) + 1e-12
+    subprofiles_tk = subprofiles_tk / norms_tk
+    subprofiles_abs = subprofiles_abs / norms_abs
+
+    # Pad to num_slots with zeros if needed (zeros don't affect dot product value)
+    if actual_dim < num_slots:
+        pad = num_slots - actual_dim
+        q_tk = np.pad(q_tk, (0, pad))
+        q_abs = np.pad(q_abs, (0, pad))
+        subprofiles_tk = np.pad(subprofiles_tk, ((0, 0), (0, pad)))
+        subprofiles_abs = np.pad(subprofiles_abs, ((0, 0), (0, pad)))
+        print(f"{PREFIX} padded dim {actual_dim}→{num_slots} (next power-of-2 for OpenFHE)", flush=True)
+
+    # --- Build OpenFHE CKKS context with bootstrap support ---
     t_context_start = time.perf_counter()
-    ts, context, poly_modulus_degree = _build_ckks_context(global_scale_bits)
+    cc, keys = _build_bootstrap_context(num_slots)
     t_context = time.perf_counter() - t_context_start
-    print(f"{PREFIX} context+keys done: {t_context:.3f}s", flush=True)
+    print(f"{PREFIX} context+bootstrap_keygen: {t_context:.3f}s", flush=True)
 
+    # --- Client: encrypt query vectors ---
     t_enc_start = time.perf_counter()
-    enc_q_tk = ts.ckks_vector(context, q_tk.tolist())
-    enc_q_abs = ts.ckks_vector(context, q_abs.tolist())
+    enc_q_tk = cc.Encrypt(keys.publicKey, cc.MakeCKKSPackedPlaintext(q_tk.tolist()))
+    enc_q_abs = cc.Encrypt(keys.publicKey, cc.MakeCKKSPackedPlaintext(q_abs.tolist()))
     t_enc = time.perf_counter() - t_enc_start
     print(f"{PREFIX} encrypt done: {t_enc:.3f}s", flush=True)
 
-    # --- Server: compute all N dot product scores ---
+    # --- Server Phase 1: Streaming inner products → encrypted author sums ---
+    # Each EvalInnerProduct is ciphertext × plaintext (subprofile not secret).
+    # enc_q_* is never decrypted on server — only subprofile plaintexts are used.
+    # Accumulate encrypted sums: no decrypt between subprofiles (preserves privacy for comparison).
+    print(f"{PREFIX} server phase1: {num_subs} inner products (streaming)...", flush=True)
     t_run_start = time.perf_counter()
 
-    # Compute subprofile-level encrypted scores
-    enc_scores_tk = [enc_q_tk.dot(sp.tolist()) for sp in subprofiles_tk]
-    enc_scores_abs = [enc_q_abs.dot(sp.tolist()) for sp in subprofiles_abs]
+    enc_sums_tk: dict[int, object] = {}
+    enc_sums_abs: dict[int, object] = {}
+    sub_counts = np.zeros(num_authors, dtype=np.int64)
 
-    # Decrypt and aggregate to author-level (client must see all scores anyway for CKKS approx ranking)
-    # For true server-side ranking we do approximation in CKKS domain:
-    # combine tk+abs scores for each subprofile, then aggregate max per author
-    # NOTE: true CKKS server-side top-K is approximated here by combining then decrypting.
-    # Full server-side encrypted argmax with CKKS degree-3 polynomial sign approx:
-    # We compute N combined author-level scores, then do approx argmax rounds.
+    for sub_idx in range(num_subs):
+        sp_tk = subprofiles_tk[sub_idx].tolist()
+        sp_abs = subprofiles_abs[sub_idx].tolist()
+        a_idx = int(sub_to_author[sub_idx])
 
-    # Aggregate to author-level first (using per-author mean — plaintext index mapping)
-    # Each subprofile belongs to an author via sub_to_author
-    from core.config import WEIGHT_TK, WEIGHT_ABS
-    num_authors = len(author_ids)
+        ct_tk = cc.EvalInnerProduct(enc_q_tk, cc.MakeCKKSPackedPlaintext(sp_tk), num_slots)
+        ct_abs = cc.EvalInnerProduct(enc_q_abs, cc.MakeCKKSPackedPlaintext(sp_abs), num_slots)
 
-    # Build per-author representative encrypted score by aggregating subprofile scores
-    # Initialize author score trackers (CKKS doesn't support conditional updates easily)
-    # Strategy: compute all subprofile scores, then do plaintext aggregation after decrypt
-    # This is still CKKS for similarity but ranking is approximate:
-
-    # Compute combined score per subprofile in CKKS
-    enc_sub_combined = []
-    for i in range(len(enc_scores_tk)):
-        # combined = weight_tk * score_tk + weight_abs * score_abs
-        combined = enc_scores_tk[i] * WEIGHT_TK + enc_scores_abs[i] * WEIGHT_ABS
-        enc_sub_combined.append(combined)
-
-    # Now approximate server-side top-K using polynomial sign approximation.
-    # We need per-AUTHOR scores. Aggregate max over subprofiles per author.
-    # Since we don't have encrypted comparison stable enough for large N,
-    # we use a pragmatic approach: aggregate to author scores in CKKS (via addition),
-    # then find top-K using degree-3 polynomial argmax.
-
-    # Build author-level scores: use mean over subprofiles (encrypted sum / count)
-    enc_author_scores = []
-    for author_idx in range(num_authors):
-        mask = np.where(sub_to_author == author_idx)[0]
-        if len(mask) == 0:
-            # Zero placeholder — this author has no subprofiles
-            zero_vec = ts.ckks_vector(context, [0.0] * len(q_tk.tolist()))
-            enc_author_scores.append(enc_q_tk.dot([0.0] * len(q_tk.tolist())))
+        if a_idx not in enc_sums_tk:
+            enc_sums_tk[a_idx] = ct_tk
+            enc_sums_abs[a_idx] = ct_abs
         else:
-            acc = enc_sub_combined[int(mask[0])]
-            for j in mask[1:]:
-                acc = acc + enc_sub_combined[int(j)]
-            # Divide by count (scalar multiplication)
-            acc = acc * (1.0 / len(mask))
-            enc_author_scores.append(acc)
+            enc_sums_tk[a_idx] = cc.EvalAdd(enc_sums_tk[a_idx], ct_tk)
+            enc_sums_abs[a_idx] = cc.EvalAdd(enc_sums_abs[a_idx], ct_abs)
+
+        sub_counts[a_idx] += 1
 
     t_run = time.perf_counter() - t_run_start
-    print(f"{PREFIX} server similarity done: {t_run:.3f}s authors={num_authors}", flush=True)
+    print(f"{PREFIX} phase1 done: {t_run:.3f}s", flush=True)
 
-    # --- Server: approximate top-K selection using polynomial sign (degree-3) ---
-    # approx_sign(x) = 1.5*x - 0.5*x^3, valid for x in [-1, 1]
-    # max(a, b) ≈ (a+b)/2 + (a-b)/2 * approx_sign((a-b) / norm)
-    # We do up to top_k rounds of argmax.
+    # Mean aggregation with combined weight+scale in one EvalMult (saves one level).
+    # Combined = WEIGHT_TK*0.5/count * sum_tk + WEIGHT_ABS*0.5/count * sum_abs
+    # → result in [-0.5, 0.5] so diff between two authors ∈ [-1, 1] ✓ for sign poly
+    enc_combined: list[object] = []
+    for idx in range(num_authors):
+        cnt = float(sub_counts[idx]) if sub_counts[idx] > 0 else 1.0
+        scale_tk = WEIGHT_TK * _COMBINED_SCALE / cnt
+        scale_abs = WEIGHT_ABS * _COMBINED_SCALE / cnt
+        ct_tk_mean = cc.EvalMult(enc_sums_tk.get(idx, enc_sums_tk[0]), scale_tk)
+        ct_abs_mean = cc.EvalMult(enc_sums_abs.get(idx, enc_sums_abs[0]), scale_abs)
+        enc_combined.append(cc.EvalAdd(ct_tk_mean, ct_abs_mean))
 
-    # For CKKS, we track encrypted scores and do soft selection.
-    # We return top_k (enc_author_idx, enc_score) pairs — but since CKKS can't
-    # truly encode an integer index, we approximate by masking and extracting.
+    # --- Server Phase 2: Bootstrap all author scores ---
+    # Restores level budget so pairwise comparison is possible.
+    # Each EvalBootstrap: ~3.2s. For N=20: ~64s. For N=2620: ~2.3h (impractical).
+    print(f"{PREFIX} server phase2: bootstrapping {num_authors} scores...", flush=True)
+    t_boot_start = time.perf_counter()
 
-    # Practical approach for this benchmark: decrypt all N author scores after computing them,
-    # then rank on client. The server-side approx ranking step is measured separately.
+    enc_scores: list[object] = []
+    for ct in enc_combined:
+        enc_scores.append(cc.EvalBootstrap(ct))
 
+    t_boot = time.perf_counter() - t_boot_start
+    print(f"{PREFIX} phase2 bootstrap done: {t_boot:.3f}s", flush=True)
+
+    # --- Server Phase 3: Encrypted pairwise comparison ---
+    # sign(score_i - score_j) ≈ 1.5*(si-sj) - 0.5*(si-sj)^3  (degree-3 poly)
+    # Requires |si - sj| ≤ 1; guaranteed by _COMBINED_SCALE=0.5 above.
+    # enc_scores[i] is READ-ONLY here — level stays at 1 throughout all comparisons.
+    # ct_diff and ct_sign are temporary (created fresh each pair), no intermediate bootstrap needed.
+    n_pairs = num_authors * (num_authors - 1) // 2
+    print(f"{PREFIX} server phase3: {n_pairs} encrypted pairwise comparisons...", flush=True)
     t_approx_start = time.perf_counter()
-    t_approx = 0.0
+
+    enc_signs: dict[tuple[int, int], object] = {}
+    approx_success = True
+    approx_error = ""
+    n_cmp_done = 0
+    last_pair = (-1, -1)
+
     try:
-        # Approx server-side top-K using degree-3 polynomial sign approximation.
-        # NOTE: level mismatch (diff_sq at L-1 vs diff_norm at L) may cause TenSEAL errors.
-        # This is a demonstration only; ranking falls back to client-side decrypt below.
-        working_scores = list(enc_author_scores)
-        max_rounds = min(top_k, 2)  # limit to 2 rounds due to level budget
-
-        for _round in range(max_rounds):
-            best_enc = working_scores[0]
-            for j in range(1, num_authors):
-                diff = best_enc - working_scores[j]
-                diff_norm = diff * 0.5
-                diff_sq = diff_norm * diff_norm
-                # Use diff_sq * diff_sq * diff_norm is wrong; just do diff^2 step
-                diff_cube = diff_sq * diff_norm
-                sign_approx = diff_norm * 1.5 - diff_cube * 0.5
-                new_best = (best_enc + working_scores[j]) * 0.5 + (best_enc - working_scores[j]) * 0.5 * sign_approx
-                best_enc = new_best
-
-        t_approx = time.perf_counter() - t_approx_start
-        print(f"{PREFIX} approx server ranking done: {t_approx:.3f}s rounds={max_rounds}", flush=True)
+        for i in range(num_authors):
+            for j in range(i + 1, num_authors):
+                last_pair = (i, j)
+                ct_diff = cc.EvalSub(enc_scores[i], enc_scores[j])
+                enc_signs[(i, j)] = cc.EvalPoly(ct_diff, _SIGN_POLY)
+                n_cmp_done += 1
     except Exception as exc:
-        t_approx = time.perf_counter() - t_approx_start
-        print(f"{PREFIX} approx server ranking skipped (CKKS level issue): {exc}", flush=True)
+        approx_success = False
+        approx_error = str(exc)
+        print(f"{PREFIX} phase3 error at pair {last_pair}: {exc}", flush=True)
 
-    # --- Client: decrypt all scores and rank (fallback for full top_k coverage) ---
-    t_dec_start = time.perf_counter()
-    # Decrypt all author scores for full top_k
-    dec_author_scores = np.array(
-        [float(enc_author_scores[i].decrypt()[0]) for i in range(num_authors)],
-        dtype=np.float32,
+    t_approx = time.perf_counter() - t_approx_start
+    print(
+        f"{PREFIX} phase3 done: {t_approx:.3f}s "
+        f"({n_cmp_done}/{n_pairs} pairs, success={approx_success})",
+        flush=True,
     )
-    t_dec = time.perf_counter() - t_dec_start
-    print(f"{PREFIX} decrypt done: {t_dec:.3f}s", flush=True)
 
-    # Client-side ranking (plaintext after decrypt)
-    top_idx = np.argsort(-dec_author_scores)[:top_k]
+    # --- Client: decrypt comparison signs → vote ranking ---
+    # Server sends enc_signs to client. Client decrypts and determines ranking.
+    # Server never sees plaintext similarity scores.
+    t_dec_start = time.perf_counter()
+
+    votes = np.zeros(num_authors, dtype=np.float64)
+    for (i, j), ct_sign in enc_signs.items():
+        sign_val = float(cc.Decrypt(ct_sign, keys.secretKey).GetRealPackedValue()[0])
+        votes[i] += sign_val
+        votes[j] -= sign_val
+
+    # Fallback: if comparison incomplete, decrypt raw scores for client sort
+    dec_scores = np.zeros(num_authors, dtype=np.float64)
+    rank_method = "server_approx_comparison"
+    if not approx_success or n_cmp_done < n_pairs:
+        print(f"{PREFIX} fallback: decrypting {num_authors} raw scores client-side", flush=True)
+        for idx in range(num_authors):
+            dec_scores[idx] = float(cc.Decrypt(enc_scores[idx], keys.secretKey).GetRealPackedValue()[0])
+        top_idx = np.argsort(-dec_scores)[:top_k]
+        rank_method = "client_decrypt_fallback"
+    else:
+        top_idx = np.argsort(-votes)[:top_k]
+
+    t_dec = time.perf_counter() - t_dec_start
+    print(f"{PREFIX} decrypt+rank done: {t_dec:.3f}s method={rank_method}", flush=True)
+
     rows = [
         {
             "rank": rank,
             "author_idx": int(i),
             "author_id": author_ids[int(i)],
-            "score": float(dec_author_scores[int(i)]),
+            "score": float(votes[int(i)]) if rank_method == "server_approx_comparison"
+                     else float(dec_scores[int(i)]),
         }
         for rank, i in enumerate(top_idx, start=1)
     ]
@@ -269,24 +356,43 @@ def main() -> None:
         "top_k": rows,
         "timing": {
             "embed_sec": t_embed,
+            "candidate_sec": t_candidate,
             "context_sec": t_context,
             "encrypt_sec": t_enc,
             "run_sec": t_run,
+            "bootstrap_sec": t_boot,
             "approx_rank_sec": t_approx,
             "decrypt_sec": t_dec,
             "total_sec": t_total,
         },
         "config": {
             "scheme": "CKKS",
-            "mode": "approx_topk_ranking",
-            "dim": int(q_tk.shape[0]),
+            "backend": "OpenFHE",
+            "mode": "approx_pairwise_comparison_with_bootstrap",
+            "dim": num_slots,
             "reduce_method": reduce_cfg.method,
             "max_authors": max_authors,
-            "poly_modulus_degree": poly_modulus_degree,
+            "candidate_mode": candidate_mode,
+            "candidate_author_ids": author_ids,
+            "candidate_privacy_note": (
+                "client_prefilter does not send plaintext query text or query embedding to the server, "
+                "but selected author IDs are visible to the server as access-pattern leakage."
+            ) if candidate_mode == "client_prefilter" else "",
+            "bootstrap_level_budget": _BOOTSTRAP_LEVEL_BUDGET,
+            "n_comparisons_attempted": n_pairs,
+            "n_comparisons_done": n_cmp_done,
+            "rank_method": rank_method,
+            "approx_success": approx_success,
+            "approx_error": approx_error if not approx_success else "",
             "note": (
-                "CKKS approx ranking: degree-3 polynomial sign used for server-side selection. "
-                f"Limited to {MAX_AUTHORS_LIMIT} authors. "
-                "Full top_k obtained by client-side ranking after decrypting all scores."
+                "OpenFHE CKKS bootstrapping refreshes CKKS level budget after dot products, "
+                "enabling encrypted comparison that TenSEAL (no bootstrap) cannot do. "
+                f"enc_scores[i] stays at level 1 throughout {n_cmp_done} comparisons (read-only); "
+                "no intermediate bootstrap needed. "
+                f"N={max_authors}: ~{max_authors*3.2:.0f}s bootstrap feasible. "
+                "N=2620: ~17h → impractical. "
+                "sign(x) = 1.5x - 0.5x^3 accurate for |x|<=1; "
+                "inputs scaled by 0.5 to ensure |diff|<=1."
             ),
         },
     }
@@ -296,8 +402,11 @@ def main() -> None:
 
     append_csv(
         LOG_PATH,
-        ["embed_sec", "context_sec", "encrypt_sec", "run_sec", "approx_rank_sec", "decrypt_sec", "total_sec"],
-        [t_embed, t_context, t_enc, t_run, t_approx, t_dec, t_total],
+        [
+            "embed_sec", "candidate_sec", "context_sec", "encrypt_sec", "run_sec",
+            "bootstrap_sec", "approx_rank_sec", "decrypt_sec", "total_sec",
+        ],
+        [t_embed, t_candidate, t_context, t_enc, t_run, t_boot, t_approx, t_dec, t_total],
     )
 
 

@@ -12,7 +12,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
-from core.config import l2_normalize
+from core.config import WEIGHT_ABS, WEIGHT_TK, l2_normalize
 
 try:
     import torch
@@ -84,6 +84,7 @@ def load_subprofiles_split(
     reduce_dim: int | None = None,
     max_authors: int | None = None,
     max_subprofiles_per_author: int | None = None,
+    candidate_author_ids: List[str] | None = None,
 ) -> Tuple[np.ndarray, np.ndarray, List[str], np.ndarray, str]:
     """Return (sub_tk, sub_abs, author_ids, sub_to_author_idx, source)."""
     profiles, source = _load_profiles()
@@ -91,8 +92,13 @@ def load_subprofiles_split(
         empty = np.empty((0, 0), dtype=np.float32)
         return empty, empty, [], np.array([], dtype=np.int64), source
 
-    author_ids = list(profiles.keys())
-    if max_authors is not None:
+    if candidate_author_ids is not None:
+        author_ids = [author_id for author_id in candidate_author_ids if author_id in profiles]
+        source = f"{source}:candidate_prefilter"
+    else:
+        author_ids = list(profiles.keys())
+
+    if candidate_author_ids is None and max_authors is not None:
         author_ids = author_ids[:max_authors]
 
     vectors_tk: List[np.ndarray] = []
@@ -132,3 +138,52 @@ def load_subprofiles_split(
         np.array(sub_to_author, dtype=np.int64),
         source,
     )
+
+
+def select_query_candidate_author_ids(
+    *,
+    query_tk: np.ndarray,
+    query_abs: np.ndarray,
+    max_authors: int,
+    max_subprofiles_per_author: int | None = None,
+    weight_tk: float = WEIGHT_TK,
+    weight_abs: float = WEIGHT_ABS,
+) -> tuple[List[str], np.ndarray]:
+    """Select top author IDs using client-side plaintext query embeddings.
+
+    This helper is intended for privacy-preserving scenarios that need a small
+    circuit pool. It avoids sending plaintext query text or query embedding to
+    the server, but the selected author IDs are still an access-pattern leak.
+    """
+    if max_authors <= 0:
+        return [], np.array([], dtype=np.float32)
+
+    profiles, _ = _load_profiles()
+    if not profiles:
+        return [], np.array([], dtype=np.float32)
+
+    q_tk = l2_normalize(np.asarray(query_tk).reshape(-1))
+    q_abs = l2_normalize(np.asarray(query_abs).reshape(-1))
+
+    scored: list[tuple[str, float]] = []
+    for author_id, data in profiles.items():
+        sub_profiles = data.get("sub_profiles", []) or []
+        if max_subprofiles_per_author is not None:
+            sub_profiles = sub_profiles[:max_subprofiles_per_author]
+        if not sub_profiles:
+            continue
+
+        best_score: float | None = None
+        for sp in sub_profiles:
+            emb_tk = l2_normalize(_to_numpy(sp["embed_tk"]).reshape(-1))
+            emb_abs = l2_normalize(_to_numpy(sp["embed_abs"]).reshape(-1))
+            score = (weight_tk * float(emb_tk @ q_tk)) + (weight_abs * float(emb_abs @ q_abs))
+            if best_score is None or score > best_score:
+                best_score = score
+
+        if best_score is not None:
+            scored.append((author_id, best_score))
+
+    scored.sort(key=lambda row: row[1], reverse=True)
+    top = scored[:max_authors]
+    return [author_id for author_id, _ in top], np.array([score for _, score in top], dtype=np.float32)

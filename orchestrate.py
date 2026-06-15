@@ -324,8 +324,9 @@ def _append_insights(lines: list[str], results: list[dict], accuracy: dict, base
             lines.append(f"- Skenario **tercepat** (non-baseline): `{fastest_non_base['scenario']}` ({fastest_non_base['elapsed_sec']:.1f}s = {fastest_non_base['elapsed_sec']/baseline_time:.1f}× baseline)")
 
     # Accuracy insights
-    # Scenarios with limited author pool can't match baseline (which uses all authors)
-    _limited_pool = {"s1", "s2a", "s2b", "s3"}  # max_authors constrained (TFHE/CKKS circuit limit)
+    # Some scenarios still use a constrained author pool because encrypted
+    # ranking/comparison circuits are not practical at full dataset size.
+    _limited_pool = {"s1", "s2a", "s2b", "s3"}
     perfect = [k for k, r in ok.items() if k != "baseline" and accuracy.get(k, {}).get("exact_k") == accuracy.get(k, {}).get("k") and accuracy.get(k)]
     if perfect:
         lines.append(f"- **Akurasi sempurna (Exact@K=K)**: {', '.join(f'`{k}`' for k in perfect)}")
@@ -337,8 +338,9 @@ def _append_insights(lines: list[str], results: list[dict], accuracy: dict, base
             constrained_str = ", ".join(f"`{k}`" for k in constrained)
             lines.append(
                 f"- **Akurasi 0 karena pool author terbatas**: {constrained_str} "
-                "— skenario ini hanya memproses max_authors pertama (16–20), bukan semua >2000 author seperti baseline. "
-                "Ini keterbatasan circuit size / algoritma, bukan bug pada hasil enkripsi."
+                "— skenario ini hanya memproses bounded pool kecil, bukan semua >2000 author seperti baseline. "
+                "S2a/S2b dipertahankan sebagai feasibility encrypted ranking/comparison; "
+                "query-dependent private candidate retrieval berada di luar scope implementasi ini."
             )
         if unconstrained:
             lines.append(f"- **Akurasi 0 (kemungkinan skor nol/error)**: {', '.join(f'`{k}`' for k in unconstrained)} — periksa konfigurasi")

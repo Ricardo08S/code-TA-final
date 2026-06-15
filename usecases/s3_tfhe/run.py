@@ -199,7 +199,7 @@ def _runtime_stale_reason(
 
 
 def main() -> None:
-    max_authors = _get_int_env("S3_MAX_AUTHORS", 16)
+    max_authors = _get_int_env("S3_MAX_AUTHORS")  # None = all authors
     max_subprofiles = _get_int_env("S3_MAX_SUBPROFILES")
     top_k = _get_int_env("S3_TOP_K", 5) or 5
     n_features = _get_int_env("S3_N_FEATURES", 64) or 64
@@ -222,42 +222,26 @@ def main() -> None:
 
     t_total_start = time.perf_counter()
 
-    # --- Offline: train surrogate if missing ---
-    surrogate_meta_path = artifact_dir / "surrogate_meta.json"
-    expected_surrogate = _expected_surrogate_metadata(
-        max_authors=max_authors,
-        max_subprofiles=max_subprofiles,
-        n_features=n_features,
-        target_dim=target_dim,
-        alpha=alpha,
-        coef_scale=coef_scale,
-        profile_scale=profile_scale,
-        dim_reduction=dim_reduction,
-    )
-    stale_surrogate = _surrogate_stale_reason(surrogate_meta_path, expected_surrogate)
-    t_train = 0.0
-    if stale_surrogate:
-        print(f"{PREFIX} surrogate artifact stale ({stale_surrogate}), training...", flush=True)
-        t_train_start = time.perf_counter()
-        try:
-            result = train_surrogate_artifact(
-                max_authors=max_authors,
-                max_subprofiles=max_subprofiles,
-                n_features=n_features,
-                target_dim=target_dim,
-                alpha=alpha,
-                coef_scale=coef_scale,
-                profile_scale=profile_scale,
-                dim_reduction=dim_reduction,
-            )
-        except Exception as exc:
-            print(f"{PREFIX} ERROR training surrogate: {exc}", flush=True)
-            raise
-        save_surrogate_artifact(artifact_dir, result)
-        t_train = time.perf_counter() - t_train_start
-        print(f"{PREFIX} train done: {t_train:.3f}s authors={len(result.author_ids)}", flush=True)
-    else:
-        print(f"{PREFIX} surrogate artifact found at {artifact_dir}", flush=True)
+    # --- Offline: always retrain surrogate (deterministic → same data = same weights = same circuit checksum) ---
+    print(f"{PREFIX} training surrogate...", flush=True)
+    t_train_start = time.perf_counter()
+    try:
+        result = train_surrogate_artifact(
+            max_authors=max_authors,
+            max_subprofiles=max_subprofiles,
+            n_features=n_features,
+            target_dim=target_dim,
+            alpha=alpha,
+            coef_scale=coef_scale,
+            profile_scale=profile_scale,
+            dim_reduction=dim_reduction,
+        )
+    except Exception as exc:
+        print(f"{PREFIX} ERROR training surrogate: {exc}", flush=True)
+        raise
+    save_surrogate_artifact(artifact_dir, result)
+    t_train = time.perf_counter() - t_train_start
+    print(f"{PREFIX} train done: {t_train:.3f}s authors={len(result.author_ids)}", flush=True)
 
     # --- Load surrogate ---
     meta, coef_tk_i, coef_abs_i, reps_tk_i, reps_abs_i, _ = load_surrogate_artifact(artifact_dir)

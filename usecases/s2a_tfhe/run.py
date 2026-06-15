@@ -19,7 +19,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from core.config import EMBED_DIM, WEIGHT_ABS, WEIGHT_TK, scenario_output_paths
-from core.data_loader import load_subprofiles_split
+from core.data_loader import load_subprofiles_split, select_query_candidate_author_ids
 from core.embedder import build_query_embeddings
 from core.reduction import apply_reduction, resolve_reduction_config
 from core.result_writer import append_csv, write_json
@@ -158,6 +158,7 @@ def main() -> None:
     reduce_cfg = resolve_reduction_config("S2A", default_dim=64)
     device = _get_str_env("S2A_SERVER_DEVICE", "cpu")
     enc_topk_scale = _get_int_env("S2A_ENC_TOPK_SCALE", 1) or 1
+    candidate_mode = _get_str_env("S2A_CANDIDATE_MODE", "first").lower()
 
     if top_k > 15:
         raise RuntimeError(f"{PREFIX} S2a supports top_k <= 15, got {top_k}.")
@@ -174,17 +175,43 @@ def main() -> None:
     print(
         f"{PREFIX} max_authors={max_authors} top_k={top_k} "
         f"reduce_dim={reduce_cfg.target_dim} reduce_method={reduce_cfg.method} "
-        f"enc_topk_scale={enc_topk_scale} device={resolved_device}",
+        f"enc_topk_scale={enc_topk_scale} candidate_mode={candidate_mode} device={resolved_device}",
         flush=True,
     )
 
     t_total_start = time.perf_counter()
 
+    q_tk, q_abs, t_embed = build_query_embeddings(reduce_dim=None, device="cpu")
+    print(f"{PREFIX} embed done: {t_embed:.3f}s", flush=True)
+
+    candidate_author_ids = None
+    t_candidate = 0.0
+    if candidate_mode == "client_prefilter" and max_authors is not None:
+        t_candidate_start = time.perf_counter()
+        candidate_author_ids, _ = select_query_candidate_author_ids(
+            query_tk=q_tk,
+            query_abs=q_abs,
+            max_authors=max_authors,
+            max_subprofiles_per_author=max_subprofiles,
+        )
+        t_candidate = time.perf_counter() - t_candidate_start
+        print(
+            f"{PREFIX} client prefilter selected {len(candidate_author_ids)} authors "
+            f"in {t_candidate:.3f}s",
+            flush=True,
+        )
+    elif candidate_mode not in {"first", "client_prefilter"}:
+        raise ValueError(
+            f"{PREFIX} Unsupported S2A_CANDIDATE_MODE={candidate_mode!r}. "
+            "Use 'client_prefilter' or 'first'."
+        )
+
     try:
         subprofiles_tk, subprofiles_abs, author_ids, sub_to_author, source = load_subprofiles_split(
             reduce_dim=None,
-            max_authors=max_authors,
+            max_authors=max_authors if candidate_author_ids is None else None,
             max_subprofiles_per_author=max_subprofiles,
+            candidate_author_ids=candidate_author_ids,
         )
     except Exception as exc:
         print(f"{PREFIX} ERROR loading data: {exc}", flush=True)
@@ -193,13 +220,20 @@ def main() -> None:
     if subprofiles_tk.size == 0:
         raise RuntimeError("No author profiles found.")
 
+    if len(author_ids) > 32:
+        raise RuntimeError(
+            f"{PREFIX} Encrypted top-k mode supports up to 32 candidate authors, "
+            f"got {len(author_ids)}. Set S2A_MAX_AUTHORS <= 32."
+        )
+
     print(
         f"{PREFIX} source={source} authors={len(author_ids)} subprofiles={subprofiles_tk.shape[0]}",
         flush=True,
     )
 
-    q_tk, q_abs, t_embed = build_query_embeddings(reduce_dim=None, device="cpu")
-    print(f"{PREFIX} embed done: {t_embed:.3f}s", flush=True)
+    if top_k > len(author_ids):
+        print(f"{PREFIX} top_k={top_k} reduced to author count {len(author_ids)}", flush=True)
+        top_k = len(author_ids)
 
     subprofiles_tk, subprofiles_abs, q_tk, q_abs = apply_reduction(
         subprofiles_tk=subprofiles_tk,
@@ -274,6 +308,7 @@ def main() -> None:
         "top_k": rows,
         "timing": {
             "embed_sec": t_embed,
+            "candidate_sec": t_candidate,
             "compile_sec": t_compile,
             "encrypt_sec": t_enc,
             "run_sec": t_run,
@@ -286,6 +321,12 @@ def main() -> None:
             "dim": int(q_tk.shape[0]),
             "reduce_method": reduce_cfg.method,
             "max_authors": max_authors,
+            "candidate_mode": candidate_mode,
+            "candidate_author_ids": author_ids,
+            "candidate_privacy_note": (
+                "client_prefilter does not send plaintext query text or query embedding to the server, "
+                "but selected author IDs are visible to the server as access-pattern leakage."
+            ) if candidate_mode == "client_prefilter" else "",
             "device": resolved_device,
             "enc_topk_scale": enc_topk_scale,
         },
@@ -296,8 +337,8 @@ def main() -> None:
 
     append_csv(
         LOG_PATH,
-        ["embed_sec", "compile_sec", "encrypt_sec", "run_sec", "decrypt_sec", "total_sec"],
-        [t_embed, t_compile, t_enc, t_run, t_dec, t_total],
+        ["embed_sec", "candidate_sec", "compile_sec", "encrypt_sec", "run_sec", "decrypt_sec", "total_sec"],
+        [t_embed, t_candidate, t_compile, t_enc, t_run, t_dec, t_total],
     )
 
 
