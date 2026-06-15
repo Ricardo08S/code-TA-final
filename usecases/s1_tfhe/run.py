@@ -33,7 +33,10 @@ from core.surrogate import (
 
 LOG_PATH, RESULT_PATH = scenario_output_paths("s1")
 PREFIX = "[S1]"
-CIRCUIT_BUILDER_VERSION = 4
+CIRCUIT_BUILDER_VERSION = 5
+# Circuit is compiled with weight=1 for both tk and abs to keep score range small.
+_CIRCUIT_WEIGHT_TK = 1
+_CIRCUIT_WEIGHT_ABS = 1
 
 
 def _get_int_env(name: str, default: int | None = None) -> int | None:
@@ -101,6 +104,8 @@ def _build_runtime_manifest(
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "circuit_type": "topk_encrypted",
         "circuit_builder_version": CIRCUIT_BUILDER_VERSION,
+        "circuit_weight_tk": _CIRCUIT_WEIGHT_TK,
+        "circuit_weight_abs": _CIRCUIT_WEIGHT_ABS,
         "top_k": int(top_k),
         "compile_sec": float(compile_sec),
         "compile_inputset_policy": "deterministic_binary_templates_v1",
@@ -196,6 +201,10 @@ def _runtime_stale_reason(
         return f"top_k mismatch: have={manifest.get('top_k')!r} want={top_k!r}"
     if int(manifest.get("circuit_builder_version", -1)) != CIRCUIT_BUILDER_VERSION:
         return "circuit builder version changed"
+    if int(manifest.get("circuit_weight_tk", -1)) != _CIRCUIT_WEIGHT_TK:
+        return f"circuit_weight_tk mismatch: have={manifest.get('circuit_weight_tk')!r} want={_CIRCUIT_WEIGHT_TK!r}"
+    if int(manifest.get("circuit_weight_abs", -1)) != _CIRCUIT_WEIGHT_ABS:
+        return f"circuit_weight_abs mismatch: have={manifest.get('circuit_weight_abs')!r} want={_CIRCUIT_WEIGHT_ABS!r}"
     if manifest.get("resolved_device") != resolved_device:
         return f"device mismatch: have={manifest.get('resolved_device')!r} want={resolved_device!r}"
     if manifest.get("metadata") != metadata:
@@ -310,8 +319,8 @@ def main() -> None:
                 coef_abs_i=coef_abs_i,
                 reps_tk_i=reps_tk_i,
                 reps_abs_i=reps_abs_i,
-                weight_tk_i=1,
-                weight_abs_i=1,
+                weight_tk_i=_CIRCUIT_WEIGHT_TK,
+                weight_abs_i=_CIRCUIT_WEIGHT_ABS,
                 top_k=top_k,
                 use_gpu=use_gpu,
             )

@@ -564,7 +564,6 @@ def build_encrypted_surrogate_topk_circuit(
     inputset = build_deterministic_binary_inputset(input_len)
     config = fhe.Configuration(
         parameter_selection_strategy="mono",
-        global_p_error=0.05,
         use_gpu=use_gpu,
     )
     compiler = fhe.Compiler(encrypted_surrogate_topk, {"query_features": "encrypted"})

@@ -188,6 +188,12 @@ Di akhir setiap run, orchestrator:
 ./venv/bin/python orchestrate.py --clean-artifacts
 ```
 
+### Menyimpan PID nohup yang sedang run
+
+```bash
+echo $! > logs/nohup.pid
+```
+
 Di akhir setiap run, orchestrator mencetak summary table otomatis yang mencakup **waktu** dan **akurasi vs baseline**:
 
 ```
