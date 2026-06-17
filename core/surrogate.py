@@ -215,14 +215,18 @@ def train_surrogate_artifact(
     profile_scale: int = 8,
     dim_reduction: str = "pca",
     feature_type: str = "hashing",
+    candidate_author_ids: list[str] | None = None,
 ) -> SurrogateBuildResult:
     """Train Ridge regression surrogate: binary features -> reduced MiniLM embeddings."""
     t0 = time.perf_counter()
     profiles = _load_author_profiles()
 
-    author_ids = list(profiles.keys())
-    if max_authors is not None:
-        author_ids = author_ids[:max_authors]
+    if candidate_author_ids is not None:
+        author_ids = [aid for aid in candidate_author_ids if aid in profiles]
+    else:
+        author_ids = list(profiles.keys())
+        if max_authors is not None:
+            author_ids = author_ids[:max_authors]
 
     tk_texts: list[str] = []
     abs_texts: list[str] = []
@@ -334,6 +338,7 @@ def train_surrogate_artifact(
         "profile_scale": int(profile_scale),
         "max_authors_requested": None if max_authors is None else int(max_authors),
         "max_subprofiles_requested": None if max_subprofiles is None else int(max_subprofiles),
+        "pool_method": "cluster_medoid" if candidate_author_ids is not None else "first_n",
         "weight_tk_i": int(round(WEIGHT_TK * 10)),
         "weight_abs_i": int(round(WEIGHT_ABS * 10)),
         "empty_text_policy": "zero_vector",

@@ -7,21 +7,21 @@ Implementasi dan orkestrasi semua skenario eksperimen untuk tugas akhir:
 
 ## Daftar Skenario
 
-| ID | Folder | Skema | Embedding | Similarity | Ranking | Dim |
-|----|--------|-------|-----------|-----------|---------|-----|
-| Baseline | `baseline` | Plaintext | Client (MiniLM) | Server (plaintext) | Client | 384 |
-| S1 | `s1_tfhe` | TFHE (Concrete) | Server (surrogate Ridge) | Server (encrypted) | Server (encrypted) | kecil* |
-| S2a | `s2a_tfhe` | TFHE (Concrete) | Client (MiniLM) | Server (encrypted) | Server (encrypted) | kecil* |
-| S2b | `s2b_ckks` | CKKS (OpenFHE + bootstrap) | Client (MiniLM) | Server (encrypted) | Server approx comparison | kecil* |
-| S3 | `s3_tfhe` | TFHE (Concrete) | Server (surrogate Ridge) | Server (encrypted) | **Client** | kecil* |
-| S4a | `s4a_tfhe` | TFHE (Concrete) | Client (MiniLM) | Server (encrypted) | Client | **384** |
-| S4b | `s4b_ckks` | CKKS (TenSEAL) | Client (MiniLM) | Server (encrypted) | Client | **384** |
-| S4c | `s4c_phe_paillier` | PHE Paillier | Client (MiniLM) | Server (encrypted) | Client | **384** |
-| S4d | `s4d_she_bgv` | SHE BGV (OpenFHE) | Client (MiniLM) | Server (encrypted) | Client | **384** |
-| S4e | `s4e_she_bfv` | SHE BFV (TenSEAL) | Client (MiniLM) | Server (encrypted) | Client | **384** |
+| ID | Folder | Skema | Embedding | Similarity | Ranking | Dim | Pool |
+|----|--------|-------|-----------|-----------|---------|-----|------|
+| Baseline | `baseline` | Plaintext | Client (MiniLM) | Server (plaintext) | Client | 384 | 2620 (semua) |
+| S1 | `s1_tfhe` | TFHE (Concrete) | Server (surrogate Ridge) | Server (encrypted) | Server (encrypted) | 8 | **8 cluster medoid** |
+| S2a | `s2a_tfhe` | TFHE (Concrete) | Client (MiniLM) | Server (encrypted) | Server (encrypted) | 16 | **8 cluster medoid** |
+| S2b | `s2b_ckks` | CKKS (OpenFHE + bootstrap) | Client (MiniLM) | Server (encrypted) | Server approx comparison | 64 | **20 cluster medoid** |
+| S3 | `s3_tfhe` | TFHE (Concrete) | Server (surrogate Ridge) | Server (encrypted) | **Client** | **32** | 2620 (semua) |
+| S4a | `s4a_tfhe` | TFHE (Concrete) | Client (MiniLM) | Server (encrypted) | Client | **384** | 2620 (semua) |
+| S4b | `s4b_ckks` | CKKS (TenSEAL) | Client (MiniLM) | Server (encrypted) | Client | **384** | 2620 (semua) |
+| S4c | `s4c_phe_paillier` | PHE Paillier | Client (MiniLM) | Server (encrypted) | Client | **384** | 2620 (semua) |
+| S4d | `s4d_she_bgv` | SHE BGV (OpenFHE) | Client (MiniLM) | Server (encrypted) | Client | **384** | 2620 (semua) |
+| S4e | `s4e_she_bfv` | SHE BFV (TenSEAL) | Client (MiniLM) | Server (encrypted) | Client | **384** | 2620 (semua) |
 
-\* S1–S3 menggunakan dimensi kecil (default 16–32) karena keterbatasan komputasi TFHE/Concrete.
-S4a–S4e menggunakan full 384-dim karena tidak ada encrypted ranking (hanya dot product).
+**Cluster Medoid** (S1/S2a/S2b): server menjalankan KMeans pada mean TK embedding semua 2620 author, lalu memilih satu representatif per cluster. Deterministik, query-independent, sepenuhnya server-side — privacy model tetap terjaga.
+S4a–S4e menggunakan full 384-dim karena tidak ada encrypted ranking (hanya dot product, ranking di client).
 
 ---
 
@@ -139,14 +139,20 @@ Berguna ketika hasil parsial tersebar di beberapa run (misalnya S4c selesai 72 m
 ### Background run yang aman ditinggal
 
 ```bash
-mkdir -p logs
-setsid ./venv/bin/python orchestrate.py --env-file .env > logs/run_all.out 2>&1 < /dev/null &
-echo "PID: $!"
-tail -f logs/run_all.out
+# Cara mudah (direkomendasikan): flag --background sudah handle setsid + log otomatis
+./venv/bin/python orchestrate.py --env-file .env --background
+# → mencetak PID dan perintah tail, lalu keluar
+# → output tersimpan otomatis ke logs/run/run_<timestamp>_full.out
+
+# Monitor progress:
+tail -f logs/run/run_*_full.out
 ```
 
-Orchestrator juga selalu membuat log internal `logs/orchestrate_<timestamp>.log`
-dan menyalinnya ke folder run `output/runs/<timestamp>/logs/`.
+Orchestrator selalu membuat dua log secara otomatis di folder terpisah:
+- `logs/orchestrate/<timestamp>.log` — hanya event START/DONE per skenario (ringkas)
+- `logs/run/<timestamp>_full.out` — seluruh output detail (semua print dari tiap run.py)
+
+Log tidak disalin ke dalam run folder — cukup di `logs/orchestrate/` dan `logs/run/`.
 
 ### Urutan yang disarankan
 
@@ -162,18 +168,21 @@ setsid ./venv/bin/python orchestrate.py --env-file .env --scenarios s4c \
   > logs/run_s4c.out 2>&1 < /dev/null &
 tail -f logs/run_s4c.out
 
-# Tahap 3: encrypted ranking/comparison bounded pool
-setsid ./venv/bin/python orchestrate.py --env-file .env --scenarios s1,s2b,s3 \
-  > logs/run_tfhe.out 2>&1 < /dev/null &
-tail -f logs/run_tfhe.out
+# Tahap 3: encrypted ranking/comparison (S1/S2a recompile circuit ~5-8 menit, S2b bootstrap ~116s)
+./venv/bin/python orchestrate.py --env-file .env --scenarios s1,s2a,s2b,s3 --background
+tail -f logs/run/run_*_full.out
 ```
 
 Di akhir setiap run, orchestrator:
 1. Membuat folder **`output/runs/<timestamp>/`**
-2. Menyalin hasil JSON ke **`results/`**, timing CSV ke **`timing/`**, dan log ke **`logs/`**
+2. Menyalin hasil JSON ke **`results/`** dan timing CSV ke **`timing/`**
 3. Menulis **`RUN_SUMMARY.md`** dan **`run_meta.json`**
 4. Memperbarui symlink **`output/runs/latest/`** ke run terbaru
 5. Mencetak summary table di terminal
+
+Log tersimpan terpisah — tidak di dalam run folder:
+- `logs/orchestrate/orchestrate_<timestamp>.log` — event per skenario (ringkas)
+- `logs/run/run_<timestamp>_full.out` — full output detail
 
 ### Membersihkan hasil run
 
@@ -226,11 +235,15 @@ Hasil benchmark resmi ditulis langsung ke folder run timestamped. Untuk membaca
 hasil final, gunakan:
 
 ```text
+# Hasil run
 output/runs/latest/RUN_SUMMARY.md
 output/runs/latest/run_meta.json
 output/runs/latest/results/result_<scenario>.json
 output/runs/latest/timing/timing_<scenario>.csv
-output/runs/latest/logs/orchestrate_<timestamp>.log
+
+# Log (terpisah dari output, bukan di dalam output/)
+logs/orchestrate/orchestrate_<timestamp>.log   # event log per run (ringkas)
+logs/run/run_<timestamp>_full.out              # full output log per run
 ```
 
 Run direct module/debug ditulis terpisah:
@@ -326,9 +339,11 @@ Query text → MiniLM (384-dim, full) → [quantize] → ENCRYPT (skema masing-m
 
 | Skenario | Keterbatasan |
 |----------|-------------|
-| S1, S3 | Surrogate (HashingVectorizer + Ridge) tidak seakurat MiniLM asli; untuk konfigurasi UC02 gunakan `top_k=1`, `n_features=16`, `target_dim=16`, `coef_scale=4`, `profile_scale=2`, dan CUDA jika tersedia |
-| S2a | Max 16 authors default (maks 32); `enc_topk_scale=1` wajib agar TLU input ≤ 16 bit; encrypted top-K TFHE berjalan untuk bounded pool |
-| S2b | OpenFHE CKKS + bootstrapping membuat approx pairwise comparison bisa berjalan untuk bounded pool; full 2620 author tidak praktis karena bootstrap/comparison mahal |
+| S1 | Surrogate (HashVec 16 bucket + Ridge 8-dim) approksimasi MiniLM; `profile_scale=2` wajib kecil agar TLU tidak overflow; pool 8 author cluster medoid |
+| S3 | Surrogate (HashVec **64 bucket** + Ridge **32-dim**) lebih representatif dari S1; circuit linear (no TLU) → scale bebas; compile ~80 menit (2620 author × 32 dim) |
+| S1, S2a | Pool dibatasi **8 author** (cluster medoid) — TFHE TLU complexity eksponensial; circuit di-cache, hanya recompile jika config berubah |
+| S2a | `enc_topk_scale=1` wajib agar TLU input ≤ 16 bit; maks 32 authors |
+| S2b | Pool **20 author** (cluster medoid) — EvalBootstrap ~2.4s/author; full 2620 → ~17 jam (tidak praktis). Backend OpenFHE (bukan TenSEAL) karena hanya OpenFHE yang support bootstrapping |
 | S4c | Paillier sangat lambat: ~73 menit untuk 2620 author (5466 subprofile × 384 dim = 4.2 juta modular exponentiation 2048-bit) |
 | S4d | `plain_modulus` wajib `≡ 1 (mod 65536)` untuk NTT packed encoding — jika tidak, OpenFHE crash (C++ abort, tidak bisa di-catch Python) |
 | S4e | `plain_modulus` wajib `≡ 1 (mod 2×poly_modulus_degree)`; plus BFV mod correction untuk skor negatif setelah dekripsi |
@@ -350,14 +365,13 @@ Query text → MiniLM (384-dim, full) → [quantize] → ENCRYPT (skema masing-m
 | `S1_COEF_SCALE` | 4 | Scale kuantisasi koefisien Ridge untuk konfigurasi UC02 |
 | `S1_PROFILE_SCALE` | 2 | Scale kuantisasi profil subprofile |
 | `S1_SERVER_DEVICE` | `cuda` | `cpu`, `gpu`, atau `cuda`; gunakan CUDA jika tersedia seperti UC02 |
-| `S3_TARGET_DIM` | 32 | Lebih besar dari S1 (tanpa Phase 2) |
-| `S3_COEF_SCALE` | 8 | Sama seperti S1_COEF_SCALE |
-| `S3_PROFILE_SCALE` | 1 | Sama seperti S1_PROFILE_SCALE |
+| `S3_N_FEATURES` | 64 | Bucket HashingVectorizer query encoding (lebih besar dari S1; aman karena no TLU) |
+| `S3_TARGET_DIM` | 32 | Dimensi surrogate embedding (lebih besar dari S1; circuit linear, compile ~80 menit) |
+| `S3_COEF_SCALE` | 8 | Scale kuantisasi koefisien Ridge |
+| `S3_PROFILE_SCALE` | 8 | Scale kuantisasi profil (bisa besar karena no TLU overflow risk) |
 | `S2A_ENC_TOPK_SCALE` | 1 | Scale kuantisasi embedding S2a; **harus 1** agar output `sel()` ≤ 16 bit |
-| `S2A_MAX_AUTHORS` | 16 | Ukuran candidate pool karena encrypted ranking tidak skalabel penuh |
-| `S2A_CANDIDATE_MODE` | `first` | `first` memakai bounded pool statis untuk feasibility; `client_prefilter` hanya opsi eksperimen jika author index boleh ada di client |
-| `S2B_MAX_AUTHORS` | 20 | Ukuran candidate pool karena approx comparison/bootstrap mahal |
-| `S2B_CANDIDATE_MODE` | `first` | Sama seperti S2a; default resmi tidak memakai query-dependent client prefilter |
+| `S2A_MAX_AUTHORS` | 8 | Ukuran pool cluster medoid untuk S2a; pool selalu dipilih via KMeans medoid |
+| `S2B_MAX_AUTHORS` | 20 | Ukuran pool cluster medoid untuk S2b; dibatasi oleh biaya EvalBootstrap (~2.4s/author) |
 | `S4C_KEY_BITS` | 2048 | Paillier key size |
 | `S4D_MULT_DEPTH` | 2 | BGV multiply depth |
 | `S4D_PLAIN_MODULUS` | auto | Prima pertama > 2×scale² (dihitung otomatis) |

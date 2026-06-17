@@ -21,6 +21,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from core.config import ARTIFACTS_DIR, scenario_output_paths
+from core.data_loader import select_cluster_medoid_author_ids
 from core.surrogate import (
     build_deterministic_binary_inputset,
     build_encrypted_surrogate_topk_circuit,
@@ -246,6 +247,12 @@ def main() -> None:
 
     t_total_start = time.perf_counter()
 
+    # --- Pool selection: cluster medoid (server-side, query-independent) ---
+    medoid_ids: list[str] | None = None
+    if max_authors is not None:
+        medoid_ids = select_cluster_medoid_author_ids(max_authors)
+        print(f"{PREFIX} cluster medoid selected {len(medoid_ids)} authors", flush=True)
+
     # --- Offline: always retrain surrogate (deterministic → same data = same weights = same circuit checksum) ---
     print(f"{PREFIX} training surrogate...", flush=True)
     t_train_start = time.perf_counter()
@@ -259,6 +266,7 @@ def main() -> None:
             coef_scale=coef_scale,
             profile_scale=profile_scale,
             dim_reduction=dim_reduction,
+            candidate_author_ids=medoid_ids,
         )
     except Exception as exc:
         print(f"{PREFIX} ERROR training surrogate: {exc}", flush=True)

@@ -16,10 +16,35 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
+
+class _TeeWriter:
+    """Writes to terminal and a log file simultaneously. Used to auto-capture full stdout."""
+    def __init__(self, terminal, logfile):
+        self._term = terminal
+        self._log = logfile
+
+    def write(self, data):
+        self._term.write(data)
+        if not self._log.closed:
+            self._log.write(data)
+
+    def flush(self):
+        self._term.flush()
+        if not self._log.closed:
+            self._log.flush()
+
+    @property
+    def encoding(self):
+        return getattr(self._term, "encoding", "utf-8")
+
+    def isatty(self):
+        return self._term.isatty() if hasattr(self._term, "isatty") else False
+
 
 ROOT_DIR = Path(__file__).resolve().parent
 if str(ROOT_DIR) not in sys.path:
@@ -28,6 +53,8 @@ if str(ROOT_DIR) not in sys.path:
 OUTPUT_DIR = ROOT_DIR / "output"
 RUNS_DIR = OUTPUT_DIR / "runs"
 LOG_DIR = ROOT_DIR / "logs"
+ORCHESTRATE_LOG_DIR = LOG_DIR / "orchestrate"
+RUN_LOG_DIR = LOG_DIR / "run"
 ARTIFACTS_DIR = ROOT_DIR / "artifacts"
 CONCRETE_ARTIFACTS_DIR = ROOT_DIR / ".artifacts"
 
@@ -148,13 +175,23 @@ def parse_args() -> argparse.Namespace:
         "--clean",
         action="store_true",
         default=False,
-        help="Delete generated output/ and logs/ contents, then exit unless scenarios are also requested.",
+        help="Delete generated output/, logs/orchestrate/, and logs/run/ contents, then exit unless scenarios are also requested.",
     )
     parser.add_argument(
         "--clean-artifacts",
         action="store_true",
         default=False,
         help="Delete artifacts/ and .artifacts/ contents. Combine with --clean for a full reset.",
+    )
+    parser.add_argument(
+        "--background",
+        action="store_true",
+        default=False,
+        help=(
+            "Relaunch orchestrator in background (detached). "
+            "Full output saved to logs/run/<timestamp>_full.out automatically. "
+            "Prints PID and tail command, then exits."
+        ),
     )
     return parser.parse_args()
 
@@ -175,7 +212,8 @@ def _clean_dir_contents(path: Path, *, keep_gitkeep: bool = True) -> None:
 def clean_generated(*, include_output_logs: bool, include_artifacts: bool) -> None:
     if include_output_logs:
         print("[orchestrate] cleaning generated logs and output...", flush=True)
-        _clean_dir_contents(LOG_DIR)
+        _clean_dir_contents(ORCHESTRATE_LOG_DIR)
+        _clean_dir_contents(RUN_LOG_DIR)
         _clean_dir_contents(OUTPUT_DIR)
     if include_artifacts:
         print("[orchestrate] cleaning artifacts and Concrete compiler artifacts...", flush=True)
@@ -452,17 +490,14 @@ def _save_run_folder(
     accuracy: dict,
     output_dir: Path,
     run_timestamp: str,
-    log_file: Path | None = None,
     source_results_dir: Path | None = None,
     source_timing_dir: Path | None = None,
 ) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     results_dir = run_dir / "results"
     timing_dir = run_dir / "timing"
-    logs_dir = run_dir / "logs"
     results_dir.mkdir(parents=True, exist_ok=True)
     timing_dir.mkdir(parents=True, exist_ok=True)
-    logs_dir.mkdir(parents=True, exist_ok=True)
 
     # Copy result JSONs for this run
     source_results_dir = source_results_dir or output_dir
@@ -479,9 +514,6 @@ def _save_run_folder(
         if timing_src.exists() and timing_src.resolve() != timing_dest.resolve():
             shutil.copy2(timing_src, timing_dest)
 
-    if log_file is not None and log_file.exists():
-        shutil.copy2(log_file, logs_dir / log_file.name)
-
     # Write RUN_SUMMARY.md
     _generate_run_summary(run_dir, results, accuracy, run_timestamp)
 
@@ -496,7 +528,8 @@ def _save_run_folder(
         "layout": {
             "results": "results/result_<scenario>.json",
             "timing": "timing/timing_<scenario>.csv",
-            "logs": "logs/",
+            "logs_orchestrate": str(ORCHESTRATE_LOG_DIR),
+            "logs_run": str(RUN_LOG_DIR),
             "summary": "RUN_SUMMARY.md",
         },
     }
@@ -534,17 +567,56 @@ def main() -> None:
         print(f"[orchestrate] WARNING: --env-file {args.env_file} not found, continuing without it.", flush=True)
 
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # --- Background mode: relaunch detached, print PID + tail command, then exit ---
+    if args.background:
+        RUN_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        full_log = RUN_LOG_DIR / f"run_{run_timestamp}_full.out"
+        cmd = [sys.executable, str(Path(__file__).resolve())]
+        if args.scenarios:
+            cmd += ["--scenarios", args.scenarios]
+        if args.env_file:
+            cmd += ["--env-file", str(args.env_file)]
+        if args.summary_only:
+            cmd += ["--summary-only"]
+        with open(full_log, "w") as _bg_f:
+            proc = subprocess.Popen(
+                cmd, stdout=_bg_f, stderr=_bg_f,
+                stdin=subprocess.DEVNULL, start_new_session=True,
+            )
+        print(f"[orchestrate] background PID={proc.pid}")
+        print(f"[orchestrate] log: {full_log}")
+        print(f"  tail -f {full_log}")
+        return
+
     output_dir = OUTPUT_DIR
     runs_dir = RUNS_DIR
     run_dir = runs_dir / run_timestamp
 
-    logger, log_file = _setup_logger(LOG_DIR, run_timestamp)
+    # --- TeeWriter: auto-save full stdout+stderr to logs/run/<timestamp>_full.out ---
+    RUN_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _full_log_path = RUN_LOG_DIR / f"run_{run_timestamp}_full.out"
+    _full_log_fh = open(_full_log_path, "w", encoding="utf-8", buffering=1)
+    _orig_stdout, _orig_stderr = sys.stdout, sys.stderr
+    sys.stdout = _TeeWriter(sys.stdout, _full_log_fh)
+    sys.stderr = _TeeWriter(sys.stderr, _full_log_fh)
+
+    def _close_tee():
+        sys.stdout = _orig_stdout
+        sys.stderr = _orig_stderr
+        if not _full_log_fh.closed:
+            _full_log_fh.flush()
+            _full_log_fh.close()
+
+    logger, _ = _setup_logger(ORCHESTRATE_LOG_DIR, run_timestamp)
+    logger.info(f"[orchestrate] full output log: {_full_log_path}")
 
     if args.scenarios:
         selected_keys = [s.strip().lower() for s in args.scenarios.split(",") if s.strip()]
         unknown = [k for k in selected_keys if k not in SCENARIOS]
         if unknown:
             logger.error(f"Unknown scenarios: {unknown}. Available: {list(SCENARIOS.keys())}")
+            _close_tee()
             sys.exit(1)
     else:
         selected_keys = list(SCENARIOS.keys())
@@ -585,13 +657,13 @@ def main() -> None:
                 accuracy,
                 output_dir,
                 run_timestamp,
-                log_file=log_file,
                 source_results_dir=source_results_dir,
                 source_timing_dir=source_timing_dir,
             )
         except Exception as exc:
             logger.warning(f"[orchestrate] Could not save run folder: {exc}")
         logger.info(f"[orchestrate] summary-only run complete. See {run_dir}/RUN_SUMMARY.md")
+        _close_tee()
         return
 
     logger.info(f"[orchestrate] running scenarios: {selected_keys}")
@@ -660,7 +732,6 @@ def main() -> None:
             accuracy,
             output_dir,
             run_timestamp,
-            log_file=log_file,
             source_results_dir=run_results_dir,
             source_timing_dir=run_timing_dir,
         )
@@ -701,6 +772,8 @@ def main() -> None:
     n_ok = sum(1 for r in results if r["status"] == "OK")
     n_err = len(results) - n_ok
     logger.info(f"[orchestrate] finished: {n_ok}/{len(results)} OK, {n_err} errors")
+
+    _close_tee()
 
     if n_err > 0:
         sys.exit(1)

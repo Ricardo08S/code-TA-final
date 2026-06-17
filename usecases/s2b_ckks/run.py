@@ -30,7 +30,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from core.config import WEIGHT_ABS, WEIGHT_TK, scenario_output_paths
-from core.data_loader import load_subprofiles_split, select_query_candidate_author_ids
+from core.data_loader import load_subprofiles_split, select_cluster_medoid_author_ids
 from core.embedder import build_query_embeddings
 from core.reduction import apply_reduction, resolve_reduction_config
 from core.result_writer import append_csv, write_json
@@ -117,11 +117,10 @@ def main() -> None:
     max_subprofiles = _get_int_env("S2B_MAX_SUBPROFILES")
     top_k = _get_int_env("S2B_TOP_K", 5) or 5
     reduce_cfg = resolve_reduction_config("S2B", default_dim=64)
-    candidate_mode = os.environ.get("S2B_CANDIDATE_MODE", "first").strip().lower()
 
     print(
         f"{PREFIX} max_authors={max_authors} top_k={top_k} "
-        f"reduce_dim={reduce_cfg.target_dim} candidate_mode={candidate_mode} backend=OpenFHE+bootstrap",
+        f"reduce_dim={reduce_cfg.target_dim} pool=cluster_medoid backend=OpenFHE+bootstrap",
         flush=True,
     )
 
@@ -131,33 +130,18 @@ def main() -> None:
     q_tk, q_abs, t_embed = build_query_embeddings(reduce_dim=None, device="cpu")
     print(f"{PREFIX} embed done: {t_embed:.3f}s", flush=True)
 
-    candidate_author_ids = None
-    t_candidate = 0.0
-    if candidate_mode == "client_prefilter" and max_authors is not None:
-        t_candidate_start = time.perf_counter()
-        candidate_author_ids, _ = select_query_candidate_author_ids(
-            query_tk=q_tk,
-            query_abs=q_abs,
-            max_authors=max_authors,
-            max_subprofiles_per_author=max_subprofiles,
-        )
-        t_candidate = time.perf_counter() - t_candidate_start
-        print(
-            f"{PREFIX} client prefilter selected {len(candidate_author_ids)} authors "
-            f"in {t_candidate:.3f}s",
-            flush=True,
-        )
-    elif candidate_mode not in {"first", "client_prefilter"}:
-        raise ValueError(
-            f"{PREFIX} Unsupported S2B_CANDIDATE_MODE={candidate_mode!r}. "
-            "Use 'client_prefilter' or 'first'."
-        )
+    # --- Pool selection: cluster medoid (server-side, query-independent) ---
+    t_candidate_start = time.perf_counter()
+    candidate_author_ids = select_cluster_medoid_author_ids(max_authors) if max_authors is not None else None
+    t_candidate = time.perf_counter() - t_candidate_start
+    if candidate_author_ids is not None:
+        print(f"{PREFIX} cluster medoid selected {len(candidate_author_ids)} authors in {t_candidate:.3f}s", flush=True)
 
     # --- Load author subprofiles ---
     try:
         subprofiles_tk, subprofiles_abs, author_ids, sub_to_author, source = load_subprofiles_split(
             reduce_dim=None,
-            max_authors=max_authors if candidate_author_ids is None else None,
+            max_authors=None if candidate_author_ids is not None else max_authors,
             max_subprofiles_per_author=max_subprofiles,
             candidate_author_ids=candidate_author_ids,
         )
@@ -372,12 +356,8 @@ def main() -> None:
             "dim": num_slots,
             "reduce_method": reduce_cfg.method,
             "max_authors": max_authors,
-            "candidate_mode": candidate_mode,
+            "pool_method": "cluster_medoid",
             "candidate_author_ids": author_ids,
-            "candidate_privacy_note": (
-                "client_prefilter does not send plaintext query text or query embedding to the server, "
-                "but selected author IDs are visible to the server as access-pattern leakage."
-            ) if candidate_mode == "client_prefilter" else "",
             "bootstrap_level_budget": _BOOTSTRAP_LEVEL_BUDGET,
             "n_comparisons_attempted": n_pairs,
             "n_comparisons_done": n_cmp_done,

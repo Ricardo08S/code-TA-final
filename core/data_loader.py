@@ -140,6 +140,43 @@ def load_subprofiles_split(
     )
 
 
+def select_cluster_medoid_author_ids(n_clusters: int) -> list[str]:
+    """Select n_clusters author IDs as cluster medoids (server-side, query-independent pool).
+
+    Uses KMeans on mean TK author embeddings. Deterministic (random_state=42).
+    Each cluster contributes exactly one representative — the author closest to its centroid.
+    """
+    from sklearn.cluster import KMeans
+
+    profiles, _ = _load_profiles()
+    if not profiles:
+        return []
+
+    author_ids: list[str] = []
+    embeddings: list[np.ndarray] = []
+    for author_id, data in profiles.items():
+        sub_profiles = data.get("sub_profiles", []) or []
+        if not sub_profiles:
+            continue
+        embs = np.stack([l2_normalize(_to_numpy(sp["embed_tk"]).reshape(-1)) for sp in sub_profiles])
+        mean_emb = l2_normalize(embs.mean(axis=0))
+        author_ids.append(author_id)
+        embeddings.append(mean_emb)
+
+    X = np.array(embeddings, dtype=np.float32)
+    actual_k = min(n_clusters, len(author_ids))
+    kmeans = KMeans(n_clusters=actual_k, random_state=42, n_init=10)
+    kmeans.fit(X)
+
+    medoid_ids: list[str] = []
+    for k in range(actual_k):
+        cluster_idxs = np.where(kmeans.labels_ == k)[0]
+        centroid = kmeans.cluster_centers_[k]
+        dists = np.linalg.norm(X[cluster_idxs] - centroid, axis=1)
+        medoid_ids.append(author_ids[cluster_idxs[np.argmin(dists)]])
+    return medoid_ids
+
+
 def select_query_candidate_author_ids(
     *,
     query_tk: np.ndarray,
