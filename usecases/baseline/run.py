@@ -83,6 +83,7 @@ def main() -> None:
         "timing": {
             "embed_sec": t_embed,
             "score_sec": t_score,
+            "per_query_sec": t_embed + t_score,
             "total_sec": t_total,
         },
         "config": {

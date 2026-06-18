@@ -584,9 +584,13 @@ def main() -> None:
                 cmd, stdout=_bg_f, stderr=_bg_f,
                 stdin=subprocess.DEVNULL, start_new_session=True,
             )
+        pid_file = LOG_DIR / "nohup.pid"
+        pid_file.write_text(str(proc.pid))
         print(f"[orchestrate] background PID={proc.pid}")
+        print(f"[orchestrate] pid file: {pid_file}")
         print(f"[orchestrate] log: {full_log}")
         print(f"  tail -f {full_log}")
+        print(f"  kill $(cat {pid_file})   # untuk stop")
         return
 
     output_dir = OUTPUT_DIR

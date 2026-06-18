@@ -347,6 +347,7 @@ def main() -> None:
             "bootstrap_sec": t_boot,
             "approx_rank_sec": t_approx,
             "decrypt_sec": t_dec,
+            "per_query_sec": t_embed + t_enc + t_run + t_boot + t_approx + t_dec,
             "total_sec": t_total,
         },
         "config": {

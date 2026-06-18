@@ -141,16 +141,24 @@ Berguna ketika hasil parsial tersebar di beberapa run (misalnya S4c selesai 72 m
 ```bash
 # Cara mudah (direkomendasikan): flag --background sudah handle setsid + log otomatis
 ./venv/bin/python orchestrate.py --env-file .env --background
-# → mencetak PID dan perintah tail, lalu keluar
+# → mencetak PID, path pid file, dan perintah tail, lalu keluar
+# → PID otomatis disimpan ke logs/nohup.pid
 # → output tersimpan otomatis ke logs/run/run_<timestamp>_full.out
 
 # Monitor progress:
 tail -f logs/run/run_*_full.out
+
+# Cek status cepat (event per skenario):
+cat logs/orchestrate/orchestrate_<timestamp>.log
+
+# Stop proses background:
+kill $(cat logs/nohup.pid)
 ```
 
 Orchestrator selalu membuat dua log secara otomatis di folder terpisah:
 - `logs/orchestrate/<timestamp>.log` — hanya event START/DONE per skenario (ringkas)
 - `logs/run/<timestamp>_full.out` — seluruh output detail (semua print dari tiap run.py)
+- `logs/nohup.pid` — PID proses background terbaru (untuk stop dengan `kill`)
 
 Log tidak disalin ke dalam run folder — cukup di `logs/orchestrate/` dan `logs/run/`.
 
@@ -195,12 +203,6 @@ Log tersimpan terpisah — tidak di dalam run folder:
 
 # Hanya hapus cache/artifact compile
 ./venv/bin/python orchestrate.py --clean-artifacts
-```
-
-### Menyimpan PID nohup yang sedang run
-
-```bash
-echo $! > logs/nohup.pid
 ```
 
 Di akhir setiap run, orchestrator mencetak summary table otomatis yang mencakup **waktu** dan **akurasi vs baseline**:

@@ -189,6 +189,7 @@ def main() -> None:
             "encrypt_sec": t_enc,
             "run_sec": t_run,
             "decrypt_sec": t_dec,
+            "per_query_sec": t_embed + t_enc + t_run + t_dec,
             "total_sec": t_total,
         },
         "config": {
