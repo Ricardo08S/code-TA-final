@@ -14,7 +14,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from core.config import scenario_output_paths
-from core.data_loader import load_subprofiles_split
+from core.data_loader import load_subprofiles_split, select_cluster_medoid_author_ids
 from core.embedder import build_query_embeddings
 from core.result_writer import append_csv, format_top_k, write_json
 from core.scoring import aggregate_max_scores, combine_modal_scores
@@ -37,17 +37,25 @@ def main() -> None:
     max_authors = _get_int_env("BASELINE_MAX_AUTHORS")
     max_subprofiles = _get_int_env("BASELINE_MAX_SUBPROFILES")
     top_k = _get_int_env("BASELINE_TOP_K", 5) or 5
+    pool_mode = os.environ.get("BASELINE_POOL_MODE", "all").strip().lower()
 
+    candidate_author_ids = None
+    if pool_mode == "cluster_medoid" and max_authors is not None:
+        candidate_author_ids = select_cluster_medoid_author_ids(max_authors)
+        print(f"{PREFIX} pool=cluster_medoid selected {len(candidate_author_ids)} authors", flush=True)
+
+    pool_label = f"cluster_medoid({max_authors})" if candidate_author_ids is not None else f"all({max_authors or 'all'})"
     print(
-        f"{PREFIX} max_authors={max_authors} max_subprofiles={max_subprofiles} top_k={top_k} dim=384",
+        f"{PREFIX} pool={pool_label} max_subprofiles={max_subprofiles} top_k={top_k} dim=384",
         flush=True,
     )
 
     try:
         subprofiles_tk, subprofiles_abs, author_ids, sub_to_author, source = load_subprofiles_split(
             reduce_dim=None,
-            max_authors=max_authors,
+            max_authors=None if candidate_author_ids is not None else max_authors,
             max_subprofiles_per_author=max_subprofiles,
+            candidate_author_ids=candidate_author_ids,
         )
     except Exception as exc:
         print(f"{PREFIX} ERROR loading data: {exc}", flush=True)
@@ -90,6 +98,7 @@ def main() -> None:
             "scheme": "plaintext",
             "dim": int(q_tk.shape[0]),
             "max_authors": max_authors,
+            "pool_mode": pool_mode,
         },
     }
     print(f"{PREFIX} top_k={result['top_k'][:3]}...", flush=True)

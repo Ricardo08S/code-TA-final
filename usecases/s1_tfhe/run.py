@@ -233,8 +233,9 @@ def main() -> None:
     dim_reduction = _get_str_env("S1_DIM_REDUCTION", "pca")
     device = _get_str_env("S1_SERVER_DEVICE", "cuda")
 
-    artifact_dir = ARTIFACTS_DIR / "s1_surrogate"
-    runtime_dir = ARTIFACTS_DIR / "s1_runtime"
+    artifact_tag = f"nf{n_features}_td{target_dim}"
+    artifact_dir = ARTIFACTS_DIR / f"s1_surrogate_{artifact_tag}"
+    runtime_dir = ARTIFACTS_DIR / f"s1_runtime_{artifact_tag}_{device}"
 
     alpha_str = f"{alpha}" if alpha is not None else "auto(RidgeCV)"
     print(

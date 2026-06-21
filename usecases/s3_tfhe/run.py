@@ -208,8 +208,9 @@ def main() -> None:
     dim_reduction = _get_str_env("S3_DIM_REDUCTION", "pca")
     device = _get_str_env("S3_SERVER_DEVICE", "cpu")
 
-    artifact_dir = ARTIFACTS_DIR / "s3_surrogate"
-    runtime_dir = ARTIFACTS_DIR / "s3_runtime"
+    artifact_tag = f"nf{n_features}_td{target_dim}"
+    artifact_dir = ARTIFACTS_DIR / f"s3_surrogate_{artifact_tag}"
+    runtime_dir = ARTIFACTS_DIR / f"s3_runtime_{artifact_tag}_{device}"
 
     alpha_str = f"{alpha}" if alpha is not None else "auto(RidgeCV)"
     print(

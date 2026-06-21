@@ -52,6 +52,7 @@ if str(ROOT_DIR) not in sys.path:
 
 OUTPUT_DIR = ROOT_DIR / "output"
 RUNS_DIR = OUTPUT_DIR / "runs"
+ABLATION_DIR = OUTPUT_DIR / "ablation"
 LOG_DIR = ROOT_DIR / "logs"
 ORCHESTRATE_LOG_DIR = LOG_DIR / "orchestrate"
 RUN_LOG_DIR = LOG_DIR / "run"
@@ -191,6 +192,33 @@ def parse_args() -> argparse.Namespace:
             "Relaunch orchestrator in background (detached). "
             "Full output saved to logs/run/<timestamp>_full.out automatically. "
             "Prints PID and tail command, then exits."
+        ),
+    )
+    parser.add_argument(
+        "--ablation-group",
+        type=str,
+        default=None,
+        help=(
+            "Ablation study group name. Hasil disimpan ke output/ablation/<group>/<config>/<query>/. "
+            "Contoh: s1_params, s4_algorithms, s2a_reduce_dim, baseline."
+        ),
+    )
+    parser.add_argument(
+        "--ablation-config",
+        type=str,
+        default=None,
+        help=(
+            "Ablation config label dalam group. "
+            "Contoh: nf4_td4, nf16_td8, s4a, rd16, pool8_medoid."
+        ),
+    )
+    parser.add_argument(
+        "--query-label",
+        type=str,
+        default=None,
+        help=(
+            "Label variasi query input. "
+            "Contoh: uc1_full, uc2_title, uc3_keywords, uc4_abstract."
         ),
     )
     return parser.parse_args()
@@ -509,6 +537,27 @@ def _save_run_folder(
         if src.exists() and src.resolve() != dest.resolve():
             shutil.copy2(src, dest)
 
+        # Enrich saved result JSON with evaluation metrics (precision, recall, overlap)
+        if dest.exists() and key in accuracy:
+            try:
+                with open(dest, encoding="utf-8") as _f:
+                    _result = json.load(_f)
+                acc = accuracy[key]
+                k_val = acc.get("k", 0)
+                overlap = acc.get("overlap_k", 0)
+                _result["evaluation"] = {
+                    "vs": "baseline",
+                    "k": k_val,
+                    "overlap_at_k": overlap,
+                    "precision_at_k": round(overlap / k_val, 4) if k_val else 0.0,
+                    "recall_at_k": round(overlap / k_val, 4) if k_val else 0.0,
+                    "exact_at_k": acc.get("exact_k", 0),
+                }
+                with open(dest, "w", encoding="utf-8") as _f:
+                    json.dump(_result, _f, indent=2, ensure_ascii=False)
+            except Exception:
+                pass
+
         timing_src = source_timing_dir / f"timing_{key}.csv"
         timing_dest = timing_dir / f"timing_{key}.csv"
         if timing_src.exists() and timing_src.resolve() != timing_dest.resolve():
@@ -579,6 +628,12 @@ def main() -> None:
             cmd += ["--env-file", str(args.env_file)]
         if args.summary_only:
             cmd += ["--summary-only"]
+        if args.ablation_group:
+            cmd += ["--ablation-group", args.ablation_group]
+        if args.ablation_config:
+            cmd += ["--ablation-config", args.ablation_config]
+        if args.query_label:
+            cmd += ["--query-label", args.query_label]
         with open(full_log, "w") as _bg_f:
             proc = subprocess.Popen(
                 cmd, stdout=_bg_f, stderr=_bg_f,
@@ -595,7 +650,15 @@ def main() -> None:
 
     output_dir = OUTPUT_DIR
     runs_dir = RUNS_DIR
-    run_dir = runs_dir / run_timestamp
+    if args.ablation_group:
+        ablation_parts = [args.ablation_group]
+        if args.ablation_config:
+            ablation_parts.append(args.ablation_config)
+        if args.query_label:
+            ablation_parts.append(args.query_label)
+        run_dir = ABLATION_DIR.joinpath(*ablation_parts)
+    else:
+        run_dir = runs_dir / run_timestamp
 
     # --- TeeWriter: auto-save full stdout+stderr to logs/run/<timestamp>_full.out ---
     RUN_LOG_DIR.mkdir(parents=True, exist_ok=True)
