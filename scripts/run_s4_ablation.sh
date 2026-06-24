@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# S4 Ablation: baseline + 4 algoritma (s4a,s4b,s4d,s4e) × 3 topik × 7 input = 21 run
+# S4 Ablation: baseline + 5 algoritma (s4a,s4b,s4c,s4d,s4e) × 3 topik × 7 input = 21 run
 # Baseline (all 2620 authors, full MiniLM) dijalankan bersama untuk evaluation metrics
 # Output: output/ablation/s4_algorithms/<query_label>/
-# Estimasi: ~15 menit/run × 21 = ~5 jam
+# Estimasi: ~85 menit/run × 21 = ~30 jam (s4c/Paillier ~70 menit/query, tanpa batching)
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -40,7 +40,7 @@ run_s4() {
     QUERY_KEYWORDS="$kw" \
     QUERY_ABSTRACT="$abs" \
     "$PYTHON" orchestrate.py \
-        --scenarios baseline,s4a,s4b,s4d,s4e \
+        --scenarios baseline,s4a,s4b,s4c,s4d,s4e \
         --ablation-group s4_algorithms \
         --query-label "$label" 2>&1 | tee -a "$LOG"
 
